@@ -8,7 +8,7 @@
 #include <WiFi.h>
 #include <Firebase_ESP_Client.h>
 #include <addons/TokenHelper.h>
-#include "secrets.h"
+#include "secret.h"
 
 FirebaseData fbdo;
 FirebaseAuth fbAuth;
@@ -40,9 +40,6 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 TinyGPSPlus gps;
 HardwareSerial GPSserial(1);
 HardwareSerial ModemSerial(2);
-
-// CHANGE THIS to your phone number
-const char PHONE_NUMBER[] = "+918801501605";
 
 // ---------- GPS SETTINGS ----------
 const unsigned long GPS_TIMEOUT = 10000;
@@ -115,40 +112,51 @@ bool sendSMS(String message) {
   Serial.println("\nSMS accepted by modem.");
   return true;
 }
-  waitForModem("OK", 5000);
-  Serial.println("\nSMS accepted by modem.");
-  return true;
-}
 
 // ----- STEP 4 STARTS HERE -----
-void pushLive() { 
+float fin(float v) { return isfinite(v) ? v : 0.0f; }
+
+void pushLive() {
   Snapshot s;
   xSemaphoreTake(snapMutex, portMAX_DELAY);
   s = snap;
   xSemaphoreGive(snapMutex);
 
+  char buf[400];
+  int n = snprintf(buf, sizeof(buf),
+    "{\"ts\":%lld,\"status\":\"%s\",\"sats\":%d,\"gpsSpeed\":%.2f,"
+    "\"accelMag\":%.3f,\"accelChange\":%.3f,\"gyroMag\":%.3f,"
+    "\"rssi\":%d,\"sim\":%d",
+    (long long)time(nullptr) * 1000LL, s.status, s.sats, fin(s.gpsSpeed),
+    fin(s.accelMag), fin(s.accelChange), fin(s.gyroMag),
+    (int)WiFi.RSSI(), (int)simMode);
+  if (s.hdopOk)
+    n += snprintf(buf + n, sizeof(buf) - n, ",\"hdop\":%.2f", fin(s.hdop));
+  if (s.hasFix)
+    n += snprintf(buf + n, sizeof(buf) - n, ",\"lat\":%.6f,\"lon\":%.6f", s.lat, s.lon);
+  snprintf(buf + n, sizeof(buf) - n, "}");
+
+  Serial.print("[FB] sending: ");
+  Serial.println(buf);
+
   FirebaseJson j;
-  j.set("ts/.sv", "timestamp");            // server-side time, no NTP needed
-  j.set("status", s.status);
-  j.set("sats", s.sats);
-  if (s.hdopOk) j.set("hdop", s.hdop);
-  if (s.hasFix) { j.set("lat", s.lat); j.set("lon", s.lon); }
-  j.set("gpsSpeed", s.gpsSpeed);
-  j.set("accelMag", s.accelMag);
-  j.set("accelChange", s.accelChange);
-  j.set("gyroMag", s.gyroMag);
-  j.set("rssi", WiFi.RSSI());
-  j.set("sim", (int)simMode);              // lets the dashboard show a SIMULATION badge
-  Firebase.RTDB.setJSON(&fbdo, "/devices/sentinel01/live", &j);
+  j.setJsonData(buf);
+
+  if (Firebase.RTDB.setJSON(&fbdo, "/devices/sentinel01/live", &j)) {
+    Serial.println("[FB] live OK");
+  } else {
+    Serial.printf("[FB] live FAILED: %s | HTTP %d\n", fbdo.errorReason().c_str(), fbdo.httpCode());
+    Serial.println(fbdo.payload());
   }
+}
+
 bool pushEvent(const StatusEvent& e) {
-    FirebaseJson j;
-  j.set("ts/.sv", "timestamp");
-  j.set("from", e.from);
-  j.set("to", e.to);
-  j.set("sats", e.sats);
-  j.set("hdop", e.hdop);
-  j.set("gpsSpeed", e.spd);
+  char buf[256];
+  snprintf(buf, sizeof(buf),
+    "{\"ts\":%lld,\"from\":\"%s\",\"to\":\"%s\",\"sats\":%d,\"hdop\":%.2f,\"gpsSpeed\":%.2f}",
+    (long long)time(nullptr) * 1000LL, e.from, e.to, e.sats, fin(e.hdop), fin(e.spd));
+  FirebaseJson j;
+  j.setJsonData(buf);
   return Firebase.RTDB.pushJSON(&fbdo, "/devices/sentinel01/events", &j);
 }
 void readCommand() {
@@ -159,19 +167,57 @@ void readCommand() {
 }
 void firebaseTask(void*) {
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+int n = WiFi.scanNetworks();
+Serial.printf("[FB] Found %d networks:\n", n);
+for (int i = 0; i < n; i++) {
+  Serial.printf("   %s  (RSSI %d)\n", WiFi.SSID(i).c_str(), WiFi.RSSI(i));
+}
+  WiFi.mode(WIFI_STA);
+  WiFi.begin("Tanmay's S24 FE", "youarewelcome");
+  Serial.print("[FB] Connecting to WiFi: ");
+  Serial.println("Tanmay's S24 FE");
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+    Serial.print(".");
+    if (millis() - t0 > 30000) {            // retry every 30 s
+      Serial.println("\n[FB] WiFi timeout, retrying...");
+      WiFi.disconnect();
+      WiFi.begin("Tanmay's S24 FE", "youarewelcome");
+      t0 = millis();
+    }
+  }
+  Serial.print("\n[FB] WiFi connected, IP: ");
+  Serial.println(WiFi.localIP());
+  configTime(19800, 0, "pool.ntp.org", "time.google.com");   // IST; SSL/auth needs correct time
+  unsigned long tw = millis();
+while (time(nullptr) < 1700000000 && millis() - tw < 15000) vTaskDelay(pdMS_TO_TICKS(200));
 
-  fbConfig.api_key = AIzaSyC3s0nonk22rvKT-mGNGpCGHE1KakSULN8;
-  fbConfig.database_url = https://sentinel-bc1f1-default-rtdb.asia-southeast1.firebasedatabase.app;
-  fbAuth.user.email = xyz678@gmail.com;
-  fbAuth.user.password = xyz678;
+  fbConfig.api_key = "AIzaSyC3s0nonk22rvKT-mGNGpCGHE1KakSULN8";
+  fbConfig.database_url = "sentinel-bc1f1-default-rtdb.asia-southeast1.firebasedatabase.app";
   fbConfig.token_status_callback = tokenStatusCallback;
   Firebase.reconnectNetwork(true);
+  fbdo.setBSSLBufferSize(4096, 1024);
+  fbdo.setResponseSize(2048);
+  fbConfig.signer.test_mode = true;
   Firebase.begin(&fbConfig, &fbAuth);
+  Serial.println("[FB] Firebase.begin called, waiting for token...");
 
-  unsigned long lastLive = 0, lastCmd = 0;
+  unsigned long lastLive = 0, lastCmd = 0, lastDbg = 0;
   for (;;) {
+    if (millis() - lastDbg >= 5000) {
+      lastDbg = millis();
+      Serial.printf("[FB] WiFi=%s  FirebaseReady=%s\n",
+        WiFi.status() == WL_CONNECTED ? "CONNECTED" : "NOT CONNECTED",
+        Firebase.ready() ? "YES" : "NO");
+    }
     if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
+      static bool tested = false;
+if (!tested) {
+  tested = true;
+  if (Firebase.RTDB.setString(&fbdo, "/test/hello", "ok")) Serial.println("[FB] TEST OK");
+  else { Serial.print("[FB] TEST FAILED: "); Serial.println(fbdo.errorReason()); }
+}
       StatusEvent ev;
       while (xQueueReceive(eventQueue, &ev, 0) == pdTRUE) {
         if (!pushEvent(ev)) {                       // failed: put it back, retry later
@@ -204,10 +250,20 @@ void queueSMS(const String& m) {
 void setup() {
   Serial.begin(115200);
 
+  // Start Firebase/SMS tasks FIRST so Wi-Fi and the database work
+  // even if a sensor is missing or miswired.
+  snapMutex  = xSemaphoreCreateMutex();
+  eventQueue = xQueueCreate(10, sizeof(StatusEvent));
+  smsQueue   = xQueueCreate(4, 160);
+  strlcpy(snap.status, "GPS_ACQUIRING", sizeof(snap.status));
+  xTaskCreatePinnedToCore(firebaseTask, "fb",  20480, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(smsTask,      "sms",  4096, NULL, 1, NULL, 0);
+  // even if a sensor is missing or miswired.
+
   Wire.begin(21, 22);
 
   if (!mpu.begin()) {
-    Serial.println("MPU6050 NOT FOUND!");
+    Serial.println("MPU6050 NOT FOUND! Check SDA->GPIO21, SCL->GPIO22, VCC, GND");
     while (true) delay(100);
   }
 
@@ -226,12 +282,6 @@ void setup() {
 
   Serial.println("SENTINEL STARTED");
   Serial.println("Waiting for first GPS fix...");
-  snapMutex  = xSemaphoreCreateMutex();
-  eventQueue = xQueueCreate(10, sizeof(StatusEvent));
-  smsQueue   = xQueueCreate(4, 160);
-  strlcpy(snap.status, "GPS_ACQUIRING", sizeof(snap.status));  // never upload an empty status
-  xTaskCreatePinnedToCore(firebaseTask, "fb",  12288, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(smsTask,      "sms",  4096, NULL, 1, NULL, 0);
   // ----- STEP 5 NEW BLOCK ENDS HERE ----
 }
 
@@ -326,11 +376,9 @@ bool poorGPS =
   } else if (locationValid && speedValid &&
            (TEST_SPOOFING || gpsSpeed > 5.0) &&
            imuStationary) {
-  currentStatus = "SUSPECTED SPOOFING";
+    currentStatus = "SUSPECTED SPOOFING";
   } else {
     currentStatus = "NORMAL";
-  }
-      currentStatus = "NORMAL";
   }
 
   xSemaphoreTake(snapMutex, portMAX_DELAY);
